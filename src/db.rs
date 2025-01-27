@@ -1,9 +1,5 @@
-
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::env;
-
-pub type Pool = SqlitePool;
-
 
 pub async fn get_pool() -> anyhow::Result<SqlitePool, anyhow::Error> {
     let pool = SqlitePoolOptions::new()

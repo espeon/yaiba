@@ -1,10 +1,10 @@
 -- Add migration script here
-
 CREATE TABLE cache (
     key VARCHAR(255) PRIMARY KEY,
-    size INT NOT NULL,
+    size BIGINT NOT NULL,
     date DATETIME,
     last_access DATETIME,
     times_accessed INT DEFAULT 0,
-    importance INT
+    expiration DATETIME,
+    importance BIGINT NOT NULL DEFAULT 0
 );

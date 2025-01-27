@@ -1,4 +1,4 @@
-use time::{PrimitiveDateTime, OffsetDateTime};
+use time::OffsetDateTime;
 
 #[derive(sqlx::FromRow, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CacheEntry {
@@ -7,5 +7,6 @@ pub struct CacheEntry {
     pub date: Option<OffsetDateTime>,
     pub last_access: Option<OffsetDateTime>,
     pub times_accessed: Option<i64>,
-    pub importance: Option<i64>
+    pub expiration: Option<OffsetDateTime>,
+    pub importance: Option<i64>,
 }

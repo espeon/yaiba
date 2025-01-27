@@ -1,18 +1,16 @@
-use std::fs::File;
-
 use crate::db::get_pool;
 
 use axum::{
-    body::StreamBody,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
-    Extension, Router,
+    Extension, Json, Router,
 };
-use tokio_util::io::ReaderStream;
 use cache::Cache;
+use hyper::header;
 use sqlx::SqlitePool;
+use structs::CacheEntry;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cache;
@@ -30,13 +28,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let db = get_pool().await.expect("can connect to database");
     sqlx::migrate!().run(&db).await?;
-    let cache = cache::Cache::new(db.clone());
+    // default of 5gib
+    let max_size_bytes = std::env::var("MAX_SIZE_BYTES")
+        .unwrap_or_else(|_| "5368709120".into())
+        .parse()
+        .unwrap();
+    let url_base = std::env::var("URL_BASE").unwrap_or_else(|_| "https://cdn.yaiba.org/".into());
+    let cache = cache::Cache::new(db.clone(), max_size_bytes, url_base);
 
     let app = Router::new()
-        .route(
-            "/*key",
-            get(serve_file),
-        )
+        .route("/all_files", get(conn))
+        .route("/*key", get(serve_file))
         .with_state(db)
         .layer(Extension(cache));
 
@@ -50,11 +52,12 @@ async fn main() -> anyhow::Result<()> {
 
 async fn conn(
     State(pool): State<SqlitePool>,
-) -> Result<String, (StatusCode, String)> {
-    sqlx::query_scalar("select 'hello world from pg'")
-        .fetch_one(&pool)
+) -> Result<Json<Vec<CacheEntry>>, (StatusCode, String)> {
+    sqlx::query_as!(CacheEntry, "select * from cache order by importance desc")
+        .fetch_all(&pool)
         .await
         .map_err(internal_error)
+        .map(Json)
 }
 
 /// serve a file based on a given key
@@ -63,22 +66,21 @@ async fn serve_file(
     Path(key): Path<String>,
     Extension(cache): Extension<Cache>,
 ) -> impl IntoResponse {
-    let file = cache.get(key).await;
+    match cache.get(key).await {
+        Ok(stream) => {
+            let headers = [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                // Add other headers as needed
+            ];
 
-    // return json response
-    match file {
-        Ok(f) => {
-            let stream = ReaderStream::new(f);
-            let body = StreamBody::new(stream);
-            Ok(body)
-        },
+            Ok((headers, stream))
+        }
         Err(e) => {
             dbg!(e);
             Err((StatusCode::NOT_FOUND, "file not found".to_owned()))
         }
     }
 }
-
 
 /// Utility function for mapping any error into a `500 Internal Server Error`
 /// response.
