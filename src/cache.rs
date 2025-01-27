@@ -1,17 +1,15 @@
-use std::{io, pin::Pin};
+use std::{pin::Pin, sync::Arc};
 
 use axum::body::StreamBody;
 use bytes::Bytes;
 use hyper::StatusCode;
-use tokio::{fs::File, io::AsyncWriteExt};
 
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 use sqlx::SqlitePool;
 use time::OffsetDateTime;
-use tokio_util::codec::{BytesCodec, FramedRead};
 use tracing::{info, warn};
 
-use crate::structs::CacheEntry;
+use crate::{storage::StorageBackend, structs::CacheEntry};
 
 #[derive(Clone)]
 pub struct Cache {
@@ -20,19 +18,19 @@ pub struct Cache {
     // TODO: make this configurable via a bucket-type system
     // similar to s3 with its subdomain and bucket prefixes
     url_base: String,
-}
-
-async fn file_to_stream(path: &str) -> io::Result<impl futures::Stream<Item = io::Result<Bytes>>> {
-    let file = File::open(path).await?;
-    let stream =
-        FramedRead::new(file, BytesCodec::new()).map(|res| res.map(|bytes_mut| bytes_mut.freeze())); // Convert BytesMut to Bytes
-    Ok(stream)
+    storage: Arc<dyn StorageBackend>,
 }
 
 impl Cache {
-    pub fn new(db: SqlitePool, max_size_bytes: i128, url_base: String) -> Cache {
+    pub fn new(
+        db: SqlitePool,
+        storage: Arc<dyn StorageBackend>,
+        max_size_bytes: i128,
+        url_base: String,
+    ) -> Cache {
         Cache {
             max_size_bytes,
+            storage,
             url_base,
             db,
         }
@@ -52,14 +50,13 @@ impl Cache {
             Ok(e) => {
                 // File exists in cache, stream from disk
                 if let Some(key) = e.key {
-                    let path = format!("./cache/{}", &key);
-                    let stream = file_to_stream(&path).await?;
+                    let stream = self.storage.retrieve(&key).await?;
                     tokio::spawn(async move {
                         if let Err(e) = self.record_access(&key).await {
                             warn!("error recording access to {}: {}", &key, e);
                         }
                     });
-                    Ok(StreamBody::new(Box::pin(stream)))
+                    Ok(StreamBody::new(stream))
                 } else {
                     // Need to download
                     let stream = self
@@ -114,6 +111,35 @@ impl Cache {
         Ok(())
     }
 
+    /// Delete a file (flush it from cache and storage)
+    pub async fn delete(&self, key: &String) -> anyhow::Result<()> {
+        if let Err(e) = self.storage.delete(key).await {
+            warn!("Failed to delete file: {}", e);
+        }
+        sqlx::query!("delete from cache where key = $1", key)
+            .execute(&self.db)
+            .await?;
+
+        Ok(())
+    }
+
+    pub async fn delete_with_prefix(&self, prefix: &String) -> anyhow::Result<()> {
+        let fmt_prefix = format!("{}%", prefix);
+        let entries = sqlx::query_as!(
+            CacheEntry,
+            "select * from cache where key like $1",
+            fmt_prefix
+        )
+        .fetch_all(&self.db)
+        .await?;
+        for entry in entries {
+            if let Err(e) = self.delete(&entry.key.unwrap()).await {
+                warn!("Failed to delete file: {}", e);
+            }
+        }
+        Ok(())
+    }
+
     pub async fn ensure_space(&self, needed: i64) -> anyhow::Result<()> {
         let current_size = sqlx::query_scalar!("SELECT COALESCE(SUM(size), 0) FROM cache")
             .fetch_one(&self.db)
@@ -139,7 +165,8 @@ impl Cache {
                         last_access,
                         times_accessed,
                         expiration,
-                        importance
+                        importance,
+                        tier
                     FROM scoring
                     ORDER BY
                         (importance * 0.5) +
@@ -154,6 +181,10 @@ impl Cache {
                     current_size = current_size as i64 - size;
                     let key = entry.key.unwrap();
                     purged_keys.push(key.clone());
+                    // delete actual file
+                    if let Err(e) = self.storage.delete(&key).await {
+                        warn!("Failed to delete file: {}", e);
+                    }
                     sqlx::query!("delete from cache where key = $1", key)
                         .execute(&self.db)
                         .await?;
@@ -167,22 +198,6 @@ impl Cache {
             info!("purged {} entries", purged);
         }
         Ok(())
-    }
-    #[allow(dead_code)]
-    pub async fn stream_url_to_disk(&self, url: String, name: &String) -> anyhow::Result<File> {
-        let req = reqwest::get(url).await?;
-        let headers = req.headers();
-        // do we have space?
-        self.ensure_space(headers.len() as i64).await?;
-        // for now - save to file
-        // TODO: stream to file and client simultaneously
-        let mut file = File::create(format!("./cache/{}", name)).await?;
-        let mut stream = req.bytes_stream();
-        while let Some(item) = stream.next().await {
-            let item = item?;
-            file.write_all(&item).await.unwrap();
-        }
-        Ok(file)
     }
     pub async fn stream_url_to_disk_and_client(
         &self,
@@ -220,61 +235,34 @@ impl Cache {
         // Create cache entry
         self.put(name, size_bytes).await?;
 
-        // Create cache file
-        let file_path = format!("./cache/{}", name);
-        let file = File::create(&file_path).await?;
-
         // Setup broadcast channel for sharing bytes
         let (tx, rx) = tokio::sync::broadcast::channel(32);
+        let storage = self.storage.clone();
+        let name = name.clone();
 
-        // Clone necessary values for spawn
-        let file_path = file_path.clone();
-
-        // Spawn file writing task
-        let file_write_handle = tokio::spawn(async move {
-            let mut file = file;
-            let mut stream = req.bytes_stream();
-
-            let mut result = Ok(());
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(bytes) => {
-                        if let Err(e) = file.write_all(&bytes).await {
-                            result = Err(e);
-                            break;
-                        }
-                        if tx.send(bytes).is_err() {
-                            break; // Channel closed
-                        }
-                    }
-                    Err(e) => {
-                        result = Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-                        break;
-                    }
+        // Create a stream that broadcasts to both storage and client
+        let stream = req
+            .bytes_stream()
+            .map_ok(move |bytes| {
+                if let Err(e) = tx.send(bytes.clone()) {
+                    warn!("Failed to send bytes to storage: {}", e);
                 }
-            }
+                bytes
+            })
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
 
-            if result.is_err() {
-                // Cleanup on error
-                if let Err(e) = tokio::fs::remove_file(&file_path).await {
-                    warn!("Failed to cleanup cache file: {}", e);
-                }
+        // Store the stream
+        let storage_stream = Box::pin(stream);
+        tokio::spawn(async move {
+            if let Err(e) = storage.store_streaming(&name, storage_stream).await {
+                warn!("Failed to store stream: {}", e);
             }
-
-            result
         });
 
         // Create client stream from broadcast receiver
         let client_stream = tokio_stream::wrappers::BroadcastStream::new(rx)
             .map_ok(|bytes| bytes)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-
-        // Spawn task to await file writing completion
-        tokio::spawn(async move {
-            if let Err(e) = file_write_handle.await {
-                warn!("File writing task failed: {}", e);
-            }
-        });
 
         Ok(Box::pin(client_stream))
     }

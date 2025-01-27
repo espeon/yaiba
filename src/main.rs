@@ -1,21 +1,29 @@
+use std::sync::Arc;
+
 use crate::db::get_pool;
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::get,
+    routing::{delete, get},
     Extension, Json, Router,
 };
 use cache::Cache;
 use hyper::header;
 use sqlx::SqlitePool;
+use storage::{fs::FilesystemStorage, StorageBackend};
 use structs::CacheEntry;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cache;
 mod db;
+mod storage;
 mod structs;
+
+fn get_storage_backend() -> Arc<dyn StorageBackend> {
+    Arc::new(FilesystemStorage::new("./cache".to_string()))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,10 +42,13 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .unwrap();
     let url_base = std::env::var("URL_BASE").unwrap_or_else(|_| "https://cdn.yaiba.org/".into());
-    let cache = cache::Cache::new(db.clone(), max_size_bytes, url_base);
+    let cache = cache::Cache::new(db.clone(), get_storage_backend(), max_size_bytes, url_base);
 
     let app = Router::new()
         .route("/all_files", get(conn))
+        .route("/api/v1/flush/prefix", delete(flush_cache_prefix))
+        .route("/api/v1/flush/*key", delete(flush_cache))
+        .route("/*key", delete(flush_cache))
         .route("/*key", get(serve_file))
         .with_state(db)
         .layer(Extension(cache));
@@ -50,6 +61,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+// TODO: put behind auth or something
+// Get all files in the sqlite cache
 async fn conn(
     State(pool): State<SqlitePool>,
 ) -> Result<Json<Vec<CacheEntry>>, (StatusCode, String)> {
@@ -80,6 +93,26 @@ async fn serve_file(
             Err((StatusCode::NOT_FOUND, "file not found".to_owned()))
         }
     }
+}
+
+async fn flush_cache(
+    Path(key): Path<String>,
+    Extension(cache): Extension<Cache>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    cache
+        .delete(&key)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+}
+
+async fn flush_cache_prefix(
+    Path(prefix): Path<String>,
+    Extension(cache): Extension<Cache>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    cache
+        .delete_with_prefix(&prefix)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
 }
 
 /// Utility function for mapping any error into a `500 Internal Server Error`

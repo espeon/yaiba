@@ -6,5 +6,7 @@ CREATE TABLE cache (
     last_access DATETIME,
     times_accessed INT DEFAULT 0,
     expiration DATETIME,
-    importance BIGINT NOT NULL DEFAULT 0
+    importance BIGINT NOT NULL DEFAULT 0,
+    -- storage tier - will implement post-mvp
+    tier varchar(255) NOT NULL DEFAULT 'base'
 );

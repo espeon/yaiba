@@ -1,11 +1,12 @@
 # Yaiba: Your Infra Is Basically A CDN Now
--# Precision engineered static asset delivery.
+Precision engineered static asset delivery.
 
 ## Usage
 
 ### Running (Development)
 
 ```bash
+touch sqlite.db && sqlx migrate run # if you don't have a database created
 cargo run
 ```
 
@@ -28,6 +29,6 @@ Yaiba, logically, stands for "**Y**our Infr**a** **I**s **B**asically **A** CDN 
 
 The actual japanese word, yaiba (刃), means the blade of a sword (the 'edge' of the sword).
 
-The leap from sword (Katana) to blade (Yaiba) isn’t just poetic – it mirrors the technical shift. Katana orchestrates edge workflows; Yaiba abstracts them entirely, treating your gateway as a seamless extension of the CDN. Logical? Sharp, even.
+The leap from sword (Katana) to blade (Yaiba) isn’t just poetic – it mirrors the technical shift. Katana orchestrates edge workflows; the goal of Yaiba is to abstract them entirely, treating your gateway as a seamless extension of the CDN. Logical? Sharp, even.
 
 p.s. if the acronym doesn't make you smirk, you're not trying hard enough.

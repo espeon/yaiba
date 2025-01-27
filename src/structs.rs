@@ -9,4 +9,5 @@ pub struct CacheEntry {
     pub times_accessed: Option<i64>,
     pub expiration: Option<OffsetDateTime>,
     pub importance: Option<i64>,
+    pub tier: String,
 }
