@@ -4,13 +4,13 @@ use crate::db::get_pool;
 
 use axum::{
     extract::{Path, State},
-    http::{HeaderValue, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
     routing::{delete, get},
     Extension, Json, Router,
 };
 use cache::Cache;
-use hyper::{header, HeaderMap};
+use hyper::HeaderMap;
 use metadata::{sqlite::SqliteCacheMetadata, CacheMetadataBackend, CacheScoringPolicy};
 use sqlx::SqlitePool;
 use storage::{fs::FilesystemStorage, StorageBackend};
@@ -67,9 +67,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let db = get_pool().await.expect("can connect to database");
     sqlx::migrate!().run(&db).await?;
-    // default of 50mib
+    // default of 500mib
     let max_size_bytes = std::env::var("MAX_SIZE_BYTES")
-        .unwrap_or_else(|_| "52428800".into())
+        .unwrap_or_else(|_| "524288000".into())
         .parse()
         .unwrap();
     let url_base = std::env::var("URL_BASE").unwrap_or_else(|_| "https://cdn.yaiba.org/".into());
@@ -84,10 +84,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(LANDING))
         .route("/all_files", get(conn))
-        .route("/api/v1/flush/prefix", delete(flush_cache_prefix))
-        .route("/api/v1/flush/*key", delete(flush_cache))
-        .route("/*key", delete(flush_cache))
-        .route("/*key", get(serve_file))
+        .route("/api/v1/flush/prefix/{*prefix}", delete(flush_cache_prefix))
+        .route("/api/v1/flush/{*key}", delete(flush_cache))
+        .route("/{*key}", delete(flush_cache))
+        .route("/{*key}", get(serve_file))
         .layer(CorsLayer::permissive())
         .with_state(db)
         .layer(Extension(cache));

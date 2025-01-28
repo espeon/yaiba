@@ -110,10 +110,14 @@ impl Cache {
         end: Option<u64>,
     ) -> anyhow::Result<(Body, hyper::HeaderMap, hyper::StatusCode)> {
         match self.storage.retrieve_range(key, start, end).await {
-            Ok((stream, end)) => {
+            Ok((stream, end, size)) => {
                 let mut headers = hyper::HeaderMap::new();
-                let fmt = &format!("bytes={:?}-{:?}", start, end);
-                headers.append("Range", fmt.parse().unwrap());
+                let fmt = &format!("bytes={:?}-{:?}/{:?}", start, end, size);
+                headers.append(
+                    "content-length",
+                    format!("{}", end - start as i64 + 1).parse().unwrap(),
+                );
+                headers.append("content-range", fmt.parse().unwrap());
                 Ok((
                     Body::from_stream(stream),
                     headers,
@@ -498,6 +502,7 @@ mod tests {
                 Box::pin(stream)
                     as Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
                 100,
+                300,
             )))
         });
 

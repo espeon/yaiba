@@ -70,6 +70,7 @@ impl StorageBackend for MemoryStorage {
     ) -> anyhow::Result<(
         Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
         i64,
+        i64,
     )> {
         todo!("not implemented")
     }

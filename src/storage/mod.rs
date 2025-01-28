@@ -32,6 +32,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     ) -> anyhow::Result<(
         Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
         i64,
+        i64,
     )>;
     /// Deletes data from the storage backend with the given key.
     async fn delete(&self, key: &str) -> anyhow::Result<()>;

@@ -42,11 +42,11 @@ impl FilesystemStorage {
         path: &str,
         start: u64,
         end: Option<u64>,
-    ) -> io::Result<(impl Stream<Item = io::Result<Bytes>>, u64)> {
+    ) -> io::Result<(impl Stream<Item = io::Result<Bytes>>, u64, u64)> {
         let mut file = File::open(path).await?;
         let file_size = file.metadata().await?.len();
 
-        let end = end.unwrap_or(file_size).min(file_size);
+        let end = end.unwrap_or(file_size - 1).min(file_size - 1);
         if start >= file_size || start > end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -55,12 +55,13 @@ impl FilesystemStorage {
         }
 
         file.seek(io::SeekFrom::Start(start)).await?;
-        let limited_reader = file.take(end - start);
+        let limited_reader = file.take(end - start + 1);
 
         Ok((
             FramedRead::new(limited_reader, BytesCodec::new())
                 .map(|res| res.map(|bytes_mut| bytes_mut.freeze())),
             end,
+            file_size,
         ))
     }
 }
@@ -130,6 +131,7 @@ impl StorageBackend for FilesystemStorage {
     ) -> anyhow::Result<(
         Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
         i64,
+        i64,
     )> {
         let path = format!("{}/{}", self.base_path, key);
         info!(
@@ -137,8 +139,12 @@ impl StorageBackend for FilesystemStorage {
             path, start, end
         );
         // Returns a stream and the end of the range
-        let (stream, r_end) = Self::file_to_stream_range(&path, start, end).await?;
-        Ok((Box::pin(stream), r_end as i64))
+        let (stream, r_end, size) = Self::file_to_stream_range(&path, start, end).await?;
+        info!(
+            "Stream range: start={}, end={}, size={}",
+            start, r_end, size
+        );
+        Ok((Box::pin(stream), r_end as i64, size as i64))
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
