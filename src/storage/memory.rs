@@ -69,8 +69,8 @@ impl StorageBackend for MemoryStorage {
         _: Option<u64>,
     ) -> anyhow::Result<(
         Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
-        i64,
-        i64,
+        u64,
+        u64,
     )> {
         todo!("not implemented")
     }

@@ -130,8 +130,8 @@ impl StorageBackend for FilesystemStorage {
         end: Option<u64>,
     ) -> anyhow::Result<(
         Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
-        i64,
-        i64,
+        u64,
+        u64,
     )> {
         let path = format!("{}/{}", self.base_path, key);
         info!(
@@ -144,7 +144,7 @@ impl StorageBackend for FilesystemStorage {
             "Stream range: start={}, end={}, size={}",
             start, r_end, size
         );
-        Ok((Box::pin(stream), r_end as i64, size as i64))
+        Ok((Box::pin(stream), r_end, size))
     }
 
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
