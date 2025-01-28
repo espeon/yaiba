@@ -57,6 +57,7 @@ impl Cache {
         self,
         k: String,
         range: Option<(u64, Option<u64>)>,
+        _last_modified_query: Option<String>,
     ) -> anyhow::Result<(Body, hyper::HeaderMap, hyper::StatusCode)> {
         let metadata = self.metadata.get_metadata(&k).await?;
 
@@ -466,7 +467,7 @@ mod tests {
         assert_eq!(result.size, Some(100));
 
         // Test get
-        let (_, _, status) = cache.clone().get("test-key".to_string(), None).await?;
+        let (_, _, status) = cache.clone().get("test-key".to_string(), None, None).await?;
         assert_eq!(status, StatusCode::OK);
 
         Ok(())
@@ -538,7 +539,7 @@ mod tests {
 
         let (_, headers, status) = cache
             .clone()
-            .get("test-key".to_string(), Some((0, Some(50))))
+            .get("test-key".to_string(), Some((0, Some(50))), None)
             .await?;
 
         assert_eq!(status, StatusCode::PARTIAL_CONTENT);

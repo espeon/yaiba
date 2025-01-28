@@ -14,7 +14,7 @@ use hyper::HeaderMap;
 use metadata::{sqlite::SqliteCacheMetadata, CacheMetadataBackend, CacheScoringPolicy};
 use sqlx::SqlitePool;
 use storage::{fs::FilesystemStorage, StorageBackend};
-use structs::CacheEntry;
+use structs::{parse_range, CacheEntry};
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tracing::info;
@@ -48,10 +48,10 @@ const LANDING: &str = r#"
     ⠀⠀⢀⡴⣊⡴⠛⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
     ⠠⠶⠥⠾⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"#;
 
+// TODO: get from config
 fn get_storage_backend() -> Arc<dyn StorageBackend> {
     Arc::new(FilesystemStorage::new("./cache".to_string()))
 }
-
 fn get_metadata_backend(pool: &SqlitePool) -> Arc<dyn CacheMetadataBackend> {
     Arc::new(SqliteCacheMetadata::new(pool))
 }
@@ -122,24 +122,11 @@ async fn serve_file(
     let range = headers.get("Range");
     let range = if let Some(range) = range {
         info!("Detected range! {:?}", range);
-        let range = range.to_str().unwrap();
-        let range = range.split('=').collect::<Vec<&str>>();
-        if range.len() == 2 {
-            let range = range[1].split('-').collect::<Vec<&str>>();
-            if range.len() == 2 {
-                let start = range[0].parse::<u64>().unwrap();
-                let end = range[1].parse::<u64>().ok();
-                Some((start, end))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
+        parse_range(range.to_str().unwrap())
     } else {
         None
     };
-    match cache.get(key, range).await {
+    match cache.get(key, range, None).await {
         Ok((stream, headers, status)) => Ok((status, headers, stream)),
         Err(e) => {
             dbg!(e);

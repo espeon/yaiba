@@ -102,6 +102,22 @@ pub struct CacheEntry {
     pub tier: String,
 }
 
+pub fn parse_range(range: &str) -> Option<(u64, Option<u64>)> {
+    let range = range.split('=').collect::<Vec<&str>>();
+    if range.len() == 2 {
+        let range = range[1].split('-').collect::<Vec<&str>>();
+        if range.len() == 2 {
+            let start = range[0].parse::<u64>().unwrap();
+            let end = range[1].parse::<u64>().ok();
+            Some((start, end))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
