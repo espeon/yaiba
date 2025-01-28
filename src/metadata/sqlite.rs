@@ -26,17 +26,19 @@ impl CacheMetadataBackend for SqliteCacheMetadata {
         key: &str,
         size_bytes: i64,
         tier: structs::CacheTier,
+        content_type: Option<String>,
     ) -> anyhow::Result<CacheEntry> {
         let current_time = OffsetDateTime::now_utc();
         let tier = tier.to_string();
         sqlx::query_as!(
         CacheEntry,
-        "insert into cache (key, size, date, importance, tier) values ($1, $2, $3, $4, $5) returning *",
+        "insert into cache (key, size, date, importance, tier, content_type) values ($1, $2, $3, $4, $5, $6) returning *",
         key,
         size_bytes,
         current_time,
         0,
-        tier
+        tier,
+        content_type
     )
     .fetch_one(&self.db)
     .await

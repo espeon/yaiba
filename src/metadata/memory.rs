@@ -28,6 +28,7 @@ impl CacheMetadataBackend for InMemoryCacheMetadata {
         key: &str,
         size_bytes: i64,
         tier: CacheTier,
+        content_type: Option<String>,
     ) -> anyhow::Result<CacheEntry> {
         let entry = CacheEntry {
             key: Some(key.to_string()),
@@ -37,6 +38,7 @@ impl CacheMetadataBackend for InMemoryCacheMetadata {
             times_accessed: Some(0),
             expiration: None,
             importance: Some(0),
+            content_type,
             tier: tier.to_string(),
         };
 
@@ -153,7 +155,7 @@ mod tests {
 
         // Test put and get
         let entry = metadata
-            .put_metadata("test_key", 100, DEFAULT_TIER)
+            .put_metadata("test_key", 100, DEFAULT_TIER, None)
             .await
             .unwrap();
         assert_eq!(entry.size, Some(100));
@@ -172,15 +174,15 @@ mod tests {
 
         // Test prefix delete
         metadata
-            .put_metadata("prefix_1", 100, DEFAULT_TIER)
+            .put_metadata("prefix_1", 100, DEFAULT_TIER, None)
             .await
             .unwrap();
         metadata
-            .put_metadata("prefix_2", 100, DEFAULT_TIER)
+            .put_metadata("prefix_2", 100, DEFAULT_TIER, None)
             .await
             .unwrap();
         metadata
-            .put_metadata("other", 100, DEFAULT_TIER)
+            .put_metadata("other", 100, DEFAULT_TIER, None)
             .await
             .unwrap();
 

@@ -30,6 +30,7 @@ pub trait CacheMetadataBackend: Send + Sync {
         key: &str,
         size_bytes: i64,
         tier: CacheTier,
+        content_type: Option<String>,
     ) -> anyhow::Result<CacheEntry>;
 
     /// Record an access to a cached item

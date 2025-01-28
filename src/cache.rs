@@ -112,10 +112,12 @@ impl Cache {
         match self.storage.retrieve_range(key, start, end).await {
             Ok((stream, end, size)) => {
                 let mut headers = hyper::HeaderMap::new();
-                let fmt = &format!("bytes={:?}-{:?}/{:?}", start, end, size);
+                // For further reference:
+                // If there's an equals sign here, it breaks ffmpeg :)
+                let fmt = &format!("bytes {:?}-{:?}/{:?}", start, end, size);
                 headers.append(
                     "content-length",
-                    format!("{}", end - start as i64 + 1).parse().unwrap(),
+                    format!("{}", end - start + 1).parse().unwrap(),
                 );
                 headers.append("content-range", fmt.parse().unwrap());
                 Ok((
@@ -142,10 +144,15 @@ impl Cache {
         });
     }
 
-    pub async fn put(&self, k: &str, size_bytes: i64) -> anyhow::Result<CacheEntry> {
+    pub async fn put(
+        &self,
+        k: &str,
+        size_bytes: i64,
+        content_type: Option<String>,
+    ) -> anyhow::Result<CacheEntry> {
         // save file to db
         self.metadata
-            .put_metadata(k, size_bytes, DEFAULT_TIER)
+            .put_metadata(k, size_bytes, DEFAULT_TIER, content_type)
             .await
     }
 
@@ -244,6 +251,13 @@ impl Cache {
             .and_then(|v| v.parse::<u64>().ok())
             .ok_or_else(|| anyhow::anyhow!("Missing Content-Length"))?;
 
+        // Get content-type for later storage
+        // TODO: there's probably a much better way to do HeaderValue -> String
+        let content_type = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+
         let range_response = headers.get("Range").and_then(|v| v.to_str().ok());
         info!("range_response: {:?}", range_response);
 
@@ -278,7 +292,10 @@ impl Cache {
                 error!("Failed to ensure cache space: {}", e);
                 return Err(e);
             }
-            if let Err(e) = self_clone.put(&name_clone, content_length as i64).await {
+            if let Err(e) = self_clone
+                .put(&name_clone, content_length as i64, content_type)
+                .await
+            {
                 error!("Failed to put cache entry: {}", e);
                 return Err(e);
             }
@@ -398,18 +415,21 @@ mod tests {
         let mut metadata = crate::metadata::MockCacheMetadataBackend::new();
 
         // Setup expectations
-        metadata.expect_put_metadata().returning(|key, size, _| {
-            Box::pin(futures::future::ready(Ok(CacheEntry {
-                key: Some(key.to_string()),
-                size: Some(size),
-                tier: DEFAULT_TIER.name.to_string(),
-                date: Some(time::OffsetDateTime::now_utc()),
-                last_access: Some(time::OffsetDateTime::now_utc()),
-                times_accessed: Some(0),
-                expiration: None,
-                importance: Some(0),
-            })))
-        });
+        metadata
+            .expect_put_metadata()
+            .returning(|key, size, _, ctype| {
+                Box::pin(futures::future::ready(Ok(CacheEntry {
+                    key: Some(key.to_string()),
+                    size: Some(size),
+                    tier: DEFAULT_TIER.name.to_string(),
+                    date: Some(time::OffsetDateTime::now_utc()),
+                    last_access: Some(time::OffsetDateTime::now_utc()),
+                    times_accessed: Some(0),
+                    expiration: None,
+                    content_type: ctype,
+                    importance: Some(0),
+                })))
+            });
 
         metadata.expect_get_metadata().returning(|key| {
             Box::pin(futures::future::ready(Ok(Some(CacheEntry {
@@ -420,6 +440,7 @@ mod tests {
                 last_access: Some(time::OffsetDateTime::now_utc()),
                 times_accessed: Some(0),
                 expiration: None,
+                content_type: None,
                 importance: Some(0),
             }))))
         });
@@ -440,7 +461,7 @@ mod tests {
         );
 
         // Test put
-        let result = cache.put("test-key", 100).await?;
+        let result = cache.put("test-key", 100, None).await?;
         assert_eq!(result.key, Some("test-key".to_string()));
         assert_eq!(result.size, Some(100));
 
@@ -492,6 +513,7 @@ mod tests {
                 last_access: Some(time::OffsetDateTime::now_utc()),
                 times_accessed: Some(0),
                 expiration: None,
+                content_type: None,
                 importance: Some(0),
             }))))
         });
@@ -542,6 +564,7 @@ mod tests {
                 date: Some(time::OffsetDateTime::now_utc()),
                 last_access: Some(time::OffsetDateTime::now_utc()),
                 times_accessed: Some(0),
+                content_type: None,
                 expiration: None,
                 importance: Some(0),
             }])))
