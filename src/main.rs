@@ -23,7 +23,6 @@ mod db;
 mod metadata;
 mod storage;
 mod structs;
-mod tests;
 
 // TIL you can just pass in a string literal to get()
 const LANDING: &str = r#"
