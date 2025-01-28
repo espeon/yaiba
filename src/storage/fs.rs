@@ -15,6 +15,16 @@ pub struct FilesystemStorage {
     base_path: String,
 }
 
+pub async fn create_dir(path: &str) -> io::Result<()> {
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        if !parent.exists() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+    Ok(())
+}
+
 pub async fn file_to_stream(
     path: &str,
 ) -> io::Result<impl futures::Stream<Item = io::Result<Bytes>>> {
@@ -72,6 +82,7 @@ impl StorageBackend for FilesystemStorage {
         let path = format!("{}/{}", self.base_path, key);
         info!("Storing cache file: {}", path);
         tokio::spawn(async move {
+            create_dir(&path).await?;
             let mut file = File::create(&path).await?;
             let mut result = Ok(());
             while let Some(item) = stream.next().await {

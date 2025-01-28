@@ -1,4 +1,4 @@
-use axum::async_trait;
+use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
 use futures::{stream, Stream};

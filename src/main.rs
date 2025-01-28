@@ -4,17 +4,19 @@ use crate::db::get_pool;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode},
     response::IntoResponse,
     routing::{delete, get},
     Extension, Json, Router,
 };
 use cache::Cache;
-use hyper::HeaderMap;
+use hyper::{header, HeaderMap};
 use metadata::{sqlite::SqliteCacheMetadata, CacheMetadataBackend, CacheScoringPolicy};
 use sqlx::SqlitePool;
 use storage::{fs::FilesystemStorage, StorageBackend};
 use structs::CacheEntry;
+use tokio::net::TcpListener;
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -86,13 +88,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/flush/*key", delete(flush_cache))
         .route("/*key", delete(flush_cache))
         .route("/*key", get(serve_file))
+        .layer(CorsLayer::permissive())
         .with_state(db)
         .layer(Extension(cache));
 
     // run it with axum on localhost:3000
-    axum::Server::bind(&"0.0.0.0:3000".parse().unwrap())
-        .serve(app.into_make_service())
-        .await?;
+    let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 
     Ok(())
 }
@@ -138,15 +140,7 @@ async fn serve_file(
         None
     };
     match cache.get(key, range).await {
-        Ok((stream, headers, status)) => {
-            // let headers = [
-            //     (header::CONTENT_TYPE, "application/octet-stream"),
-            //     // Add other headers as needed
-            // ];
-            // send status code with stream/headers
-
-            Ok((status, headers, stream))
-        }
+        Ok((stream, headers, status)) => Ok((status, headers, stream)),
         Err(e) => {
             dbg!(e);
             Err((StatusCode::NOT_FOUND, "file not found".to_owned()))

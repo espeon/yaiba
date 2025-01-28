@@ -5,7 +5,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use axum::body::StreamBody;
+use axum::body::Body;
 use bytes::Bytes;
 use hyper::StatusCode;
 
@@ -57,11 +57,7 @@ impl Cache {
         self,
         k: String,
         range: Option<(u64, Option<u64>)>,
-    ) -> anyhow::Result<(
-        StreamBody<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>>,
-        hyper::HeaderMap,
-        hyper::StatusCode,
-    )> {
+    ) -> anyhow::Result<(Body, hyper::HeaderMap, hyper::StatusCode)> {
         let metadata = self.metadata.get_metadata(&k).await?;
 
         // If no metadata or no key, download the file
@@ -82,7 +78,7 @@ impl Cache {
             Ok(stream) => {
                 self.spawn_access_recorder(&key);
                 Ok((
-                    StreamBody::new(stream),
+                    Body::from_stream(stream),
                     hyper::HeaderMap::new(),
                     StatusCode::OK,
                 ))
@@ -99,15 +95,11 @@ impl Cache {
         &self,
         k: &str,
         range: Option<(u64, Option<u64>)>,
-    ) -> anyhow::Result<(
-        StreamBody<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>>,
-        hyper::HeaderMap,
-        hyper::StatusCode,
-    )> {
+    ) -> anyhow::Result<(Body, hyper::HeaderMap, hyper::StatusCode)> {
         let (stream, headers, statuscode) = self
             .stream_url_to_disk_and_client(format!("{}{}", self.url_base, k), k, range)
             .await?;
-        Ok((StreamBody::new(stream), headers, statuscode))
+        Ok((Body::from_stream(stream), headers, statuscode))
     }
 
     async fn handle_range_request(
@@ -116,18 +108,14 @@ impl Cache {
         key: &str,
         start: u64,
         end: Option<u64>,
-    ) -> anyhow::Result<(
-        StreamBody<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>>,
-        hyper::HeaderMap,
-        hyper::StatusCode,
-    )> {
+    ) -> anyhow::Result<(Body, hyper::HeaderMap, hyper::StatusCode)> {
         match self.storage.retrieve_range(key, start, end).await {
             Ok((stream, end)) => {
                 let mut headers = hyper::HeaderMap::new();
                 let fmt = &format!("bytes={:?}-{:?}", start, end);
                 headers.append("Range", fmt.parse().unwrap());
                 Ok((
-                    StreamBody::new(stream),
+                    Body::from_stream(stream),
                     headers,
                     StatusCode::PARTIAL_CONTENT,
                 ))
