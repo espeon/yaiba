@@ -6,6 +6,8 @@ use crate::structs::{CacheEntry, CacheTier};
 
 use super::{CacheMetadataBackend, CacheScoringPolicy};
 
+/// A DashMap-backed cache metadata backend. (hi acri!)
+/// This is useful for testing, high-performance use-cases, or for when you don't need persistence.
 pub struct InMemoryCacheMetadata {
     entries: DashMap<String, CacheEntry>,
 }

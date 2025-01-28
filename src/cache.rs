@@ -62,81 +62,94 @@ impl Cache {
         hyper::HeaderMap,
         hyper::StatusCode,
     )> {
-        let k1 = k.clone();
-        if let Some(e) = self.metadata.get_metadata(&k1).await? {
-            // File exists in cache, stream from disk
-            if let Some(key) = e.key {
-                // do we need to return a byterange?
-                if let Some((s, e)) = range {
-                    // TODO: check if we want to do range bites
-                    return match self.storage.retrieve_range(&key, s, e).await {
-                        Ok((stream, end)) => {
-                            let stream = StreamBody::new(stream);
-                            let mut headers = hyper::HeaderMap::new();
-                            let fmt = &format!("bytes={:?}-{:?}", s, end);
-                            headers.append("Range", fmt.parse().unwrap());
-                            Ok((stream, headers, StatusCode::PARTIAL_CONTENT))
-                        }
-                        Err(_) => {
-                            warn!(
-                                "File could not be found on disk, attempting delete and redownload"
-                            );
-                            // purge cache entry
-                            self.metadata.delete_metadata(&k1).await?;
-                            let (stream, headers, statuscode) = self
-                                .stream_url_to_disk_and_client(
-                                    format!("{}{}", self.url_base, k),
-                                    &k,
-                                    range,
-                                )
-                                .await?;
-                            Ok((StreamBody::new(stream), headers, statuscode))
-                        }
-                    };
-                }
-                match self.storage.retrieve(&key).await {
-                    Err(_) => {
-                        warn!("File could not be found on disk, attempting delete and redownload");
-                        // purge cache entry
-                        self.metadata.delete_metadata(&k1).await?;
-                        let (stream, headers, statuscode) = self
-                            .stream_url_to_disk_and_client(
-                                format!("{}{}", self.url_base, k),
-                                &k,
-                                range,
-                            )
-                            .await?;
-                        Ok((StreamBody::new(stream), headers, statuscode))
-                    }
-                    Ok(stream) => {
-                        tokio::spawn(async move {
-                            if let Err(e) = self.record_access(&key).await {
-                                warn!("error recording access to {}: {}", &key, e);
-                            }
-                        });
-                        // TODO: add headers for file types, etc.
-                        Ok((
-                            StreamBody::new(stream),
-                            hyper::HeaderMap::new(),
-                            StatusCode::OK,
-                        ))
-                    }
-                }
-            } else {
-                // Need to download
-                let (stream, headers, statuscode) = self
-                    .stream_url_to_disk_and_client(format!("{}{}", self.url_base, k), &k, range)
-                    .await?;
-                Ok((StreamBody::new(stream), headers, statuscode))
+        let metadata = self.metadata.get_metadata(&k).await?;
+
+        // If no metadata or no key, download the file
+        let key = match metadata.and_then(|e| e.key) {
+            None => {
+                return self.download_file(&k, range).await;
             }
-        } else {
-            // Need to download - use stream_url_to_disk_and_client
-            let (stream, headers, statuscode) = self
-                .stream_url_to_disk_and_client(format!("{}{}", self.url_base, k), &k, range)
-                .await?;
-            Ok((StreamBody::new(stream), headers, statuscode))
+            Some(key) => key,
+        };
+
+        // Handle range request
+        if let Some((start, end)) = range {
+            return self.handle_range_request(&k, &key, start, end).await;
+        }
+
+        // Handle full file request
+        match self.storage.retrieve(&key).await {
+            Ok(stream) => {
+                self.spawn_access_recorder(&key);
+                Ok((
+                    StreamBody::new(stream),
+                    hyper::HeaderMap::new(),
+                    StatusCode::OK,
+                ))
+            }
+            Err(_) => {
+                warn!("File could not be found on disk, attempting delete and redownload");
+                self.metadata.delete_metadata(&k).await?;
+                self.download_file(&k, range).await
+            }
         }
     }
+
+    async fn download_file(
+        &self,
+        k: &str,
+        range: Option<(u64, Option<u64>)>,
+    ) -> anyhow::Result<(
+        StreamBody<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>>,
+        hyper::HeaderMap,
+        hyper::StatusCode,
+    )> {
+        let (stream, headers, statuscode) = self
+            .stream_url_to_disk_and_client(format!("{}{}", self.url_base, k), k, range)
+            .await?;
+        Ok((StreamBody::new(stream), headers, statuscode))
+    }
+
+    async fn handle_range_request(
+        &self,
+        k: &str,
+        key: &str,
+        start: u64,
+        end: Option<u64>,
+    ) -> anyhow::Result<(
+        StreamBody<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static>>>,
+        hyper::HeaderMap,
+        hyper::StatusCode,
+    )> {
+        match self.storage.retrieve_range(key, start, end).await {
+            Ok((stream, end)) => {
+                let mut headers = hyper::HeaderMap::new();
+                let fmt = &format!("bytes={:?}-{:?}", start, end);
+                headers.append("Range", fmt.parse().unwrap());
+                Ok((
+                    StreamBody::new(stream),
+                    headers,
+                    StatusCode::PARTIAL_CONTENT,
+                ))
+            }
+            Err(_) => {
+                warn!("File could not be found on disk, attempting delete and redownload");
+                self.metadata.delete_metadata(k).await?;
+                self.download_file(k, Some((start, end))).await
+            }
+        }
+    }
+
+    fn spawn_access_recorder(&self, key: &str) {
+        let key = key.to_string();
+        let self_clone = self.clone(); // Assuming Cache implements Clone
+        tokio::spawn(async move {
+            if let Err(e) = self_clone.record_access(&key).await {
+                warn!("error recording access to {}: {}", &key, e);
+            }
+        });
+    }
+
     pub async fn put(&self, k: &str, size_bytes: i64) -> anyhow::Result<CacheEntry> {
         // save file to db
         self.metadata
@@ -156,6 +169,7 @@ impl Cache {
         self.metadata.delete_metadata(key).await
     }
 
+    /// Delete all files with a given prefix
     pub async fn delete_with_prefix(&self, prefix: &String) -> anyhow::Result<()> {
         let fmt_prefix = format!("{}%", prefix);
         let entries = self.metadata.get_metadata_with_prefix(&fmt_prefix).await?;
@@ -168,8 +182,10 @@ impl Cache {
         Ok(())
     }
 
+    /// Ensure that the cache has at least the given amount of space available
     pub async fn ensure_space(&self, needed: i64) -> anyhow::Result<()> {
         let mut current_size = self.metadata.get_total_size().await?;
+        // if we don't have enough space, purge enough to make space
         if (current_size as i128 + needed as i128) > self.max_size_bytes {
             info!("cache full, purging enough to make space");
             let mut purged = 0;
@@ -188,7 +204,7 @@ impl Cache {
                     // delete actual file
                     if let Err(e) = self.storage.delete(&key).await {
                         warn!("Failed to delete file: {}", e);
-                        // if we can't delete the file, we shan't purge it from the db
+                        // if we can't delete the file, we can't purge it from the db
                         break;
                     }
                     self.metadata.delete_metadata(&key).await?;
@@ -199,6 +215,7 @@ impl Cache {
         }
         Ok(())
     }
+    /// Stream a file from a URL, split into two streams: one for the storage backend, one for the client
     pub async fn stream_url_to_disk_and_client(
         &self,
         url: String,

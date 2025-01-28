@@ -6,6 +6,8 @@ use crate::structs::{self, CacheEntry};
 
 use super::{CacheMetadataBackend, CacheScoringPolicy};
 
+/// A disk-backed cache metadata backend using SQLite.
+/// Will persist to disk at the configured path, so only use this for persistent storage.
 pub struct SqliteCacheMetadata {
     db: SqlitePool,
 }
