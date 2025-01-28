@@ -10,16 +10,20 @@ use axum::{
     Extension, Json, Router,
 };
 use cache::Cache;
-use hyper::header;
+use hyper::HeaderMap;
+use metadata::{sqlite::SqliteCacheMetadata, CacheMetadataBackend, CacheScoringPolicy};
 use sqlx::SqlitePool;
 use storage::{fs::FilesystemStorage, StorageBackend};
 use structs::CacheEntry;
+use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod cache;
 mod db;
+mod metadata;
 mod storage;
 mod structs;
+mod tests;
 
 // TIL you can just pass in a string literal to get()
 const LANDING: &str = r#"
@@ -47,6 +51,10 @@ fn get_storage_backend() -> Arc<dyn StorageBackend> {
     Arc::new(FilesystemStorage::new("./cache".to_string()))
 }
 
+fn get_metadata_backend(pool: &SqlitePool) -> Arc<dyn CacheMetadataBackend> {
+    Arc::new(SqliteCacheMetadata::new(pool))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
@@ -58,13 +66,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let db = get_pool().await.expect("can connect to database");
     sqlx::migrate!().run(&db).await?;
-    // default of 5gib
+    // default of 50mib
     let max_size_bytes = std::env::var("MAX_SIZE_BYTES")
-        .unwrap_or_else(|_| "5368709120".into())
+        .unwrap_or_else(|_| "52428800".into())
         .parse()
         .unwrap();
     let url_base = std::env::var("URL_BASE").unwrap_or_else(|_| "https://cdn.yaiba.org/".into());
-    let cache = cache::Cache::new(db.clone(), get_storage_backend(), max_size_bytes, url_base);
+    let cache = cache::Cache::new(
+        get_storage_backend(),
+        get_metadata_backend(&db),
+        max_size_bytes,
+        url_base,
+        CacheScoringPolicy::Lru,
+    );
 
     let app = Router::new()
         .route("/", get(LANDING))
@@ -101,15 +115,38 @@ async fn conn(
 async fn serve_file(
     Path(key): Path<String>,
     Extension(cache): Extension<Cache>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    match cache.get(key).await {
-        Ok(stream) => {
-            let headers = [
-                (header::CONTENT_TYPE, "application/octet-stream"),
-                // Add other headers as needed
-            ];
+    // get headers
+    let range = headers.get("Range");
+    let range = if let Some(range) = range {
+        info!("Detected range! {:?}", range);
+        let range = range.to_str().unwrap();
+        let range = range.split('=').collect::<Vec<&str>>();
+        if range.len() == 2 {
+            let range = range[1].split('-').collect::<Vec<&str>>();
+            if range.len() == 2 {
+                let start = range[0].parse::<u64>().unwrap();
+                let end = range[1].parse::<u64>().ok();
+                Some((start, end))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    match cache.get(key, range).await {
+        Ok((stream, headers, status)) => {
+            // let headers = [
+            //     (header::CONTENT_TYPE, "application/octet-stream"),
+            //     // Add other headers as needed
+            // ];
+            // send status code with stream/headers
 
-            Ok((headers, stream))
+            Ok((status, headers, stream))
         }
         Err(e) => {
             dbg!(e);

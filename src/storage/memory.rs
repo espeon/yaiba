@@ -61,6 +61,19 @@ impl StorageBackend for MemoryStorage {
         }
     }
 
+    // TODO: implement range retrieval for MemoryStorage!
+    async fn retrieve_range(
+        &self,
+        _: &str,
+        _: u64,
+        _: Option<u64>,
+    ) -> anyhow::Result<(
+        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        i64,
+    )> {
+        todo!("not implemented")
+    }
+
     async fn delete(&self, key: &str) -> anyhow::Result<()> {
         let storage = self.data.write().await;
         storage.remove(key);
