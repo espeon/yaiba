@@ -78,7 +78,6 @@ fn get_metadata_backend(pool: &SqlitePool) -> Arc<dyn CacheMetadataBackend> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Already using anyhow::Result
     dotenvy::dotenv().ok();
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -86,13 +85,12 @@ async fn main() -> Result<()> {
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let db = get_pool().await.context("Failed to connect to database")?; // Use context
+    let db = get_pool().await.context("Failed to connect to database")?;
     sqlx::migrate!().run(&db).await?;
-    // default of 500mib
     let max_size_bytes = std::env::var("MAX_SIZE_BYTES")
         .unwrap_or_else(|_| "524288000".into())
         .parse()
-        .context("Failed to parse MAX_SIZE_BYTES")?; // Use context
+        .context("Failed to parse MAX_SIZE_BYTES")?;
     let url_base = std::env::var("URL_BASE").unwrap_or_else(|_| "https://cdn.yaiba.org/".into());
     let pool = Arc::new(db);
     let cache = Arc::new(cache::Cache::new(
@@ -105,7 +103,7 @@ async fn main() -> Result<()> {
     ));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    let listener = TcpListener::bind(addr).await?; // Corrected port -> addr
+    let listener = TcpListener::bind(addr).await?;
 
     info!("Listening on {}", addr);
 
@@ -113,26 +111,20 @@ async fn main() -> Result<()> {
         let (stream, _) = listener.accept().await?;
         let io = hyper_util::rt::tokio::TokioIo::new(stream);
 
-        // Clone Arcs for the connection task
         let cache_clone = cache.clone();
         let pool_clone = pool.clone();
 
         tokio::task::spawn(async move {
             let builder = AutoBuilder::new(TokioExecutor);
-            // Pass cloned Arcs into the service function
             let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-                // Clone Arcs for the specific request
                 let cache_req_clone = cache_clone.clone();
                 let pool_req_clone = pool_clone.clone();
                 async move {
                     let result = handle_request(req, cache_req_clone, pool_req_clone).await;
-                    // Handle the result: Ok -> Response, Err -> Log and 500 Response
                     let response = match result {
                         Ok(resp) => resp,
                         Err(e) => {
-                            // Log the detailed error (use {:?} for anyhow::Error)
                             tracing::error!("Request handling error: {:?}", e);
-                            // Return a generic 500 response to the user
                             internal_server_error("Internal Server Error".to_string())
                         }
                     };
@@ -151,19 +143,16 @@ async fn main() -> Result<()> {
             }
         });
     }
-    // Main loop runs forever, so Ok(()) is technically unreachable
-    // but required by the function signature.
-    // Ok(())
 }
 
-// Get all files in the sqlite cache
+// get all files in the sqlite cache
 async fn list_all_files(pool: Arc<SqlitePool>) -> Result<BoxedResponse> {
     // Use anyhow::Result
     let entries = sqlx::query_as!(CacheEntry, "select * from cache order by importance desc")
-        .fetch_all(&*pool) // Deref Arc<SqlitePool> to get &SqlitePool
+        .fetch_all(&*pool)
         .await
-        .context("Failed to fetch cache entries from database")?; // Use context
-    json_response(&entries, StatusCode::OK) // Propagate Result
+        .context("Failed to fetch cache entries from database")?;
+    json_response(&entries, StatusCode::OK)
 }
 
 /// serve a file based on a given key
@@ -187,26 +176,25 @@ async fn serve_file(key: String, cache: Arc<Cache>, headers: &HeaderMap) -> Resu
                     response_builder = response_builder.header(key, value);
                 }
             }
-            // Add CORS headers manually
+            // add CORS headers manually
             response_builder = response_builder.header("Access-Control-Allow-Origin", "*");
 
-            // Build the response. If body() fails (rare), context converts the error.
             response_builder
                 .body(body)
-                .context("Failed to build response body") // This returns Result<BoxedResponse, anyhow::Error>
+                .context("Failed to build response body")
         }
         Err(e) => {
             tracing::warn!("Cache get failed for key '{}': {:?}", key, e);
             let body: BoxBody<Bytes, Box<dyn StdError + Send + Sync>> =
                 Full::new(Bytes::from("Cache entry not found or error retrieving"))
-                    .map_err(|never| -> Box<dyn StdError + Send + Sync> { Box::new(never) }) // Map Infallible error
-                    .boxed(); // Box into the correct type
+                    .map_err(|never| -> Box<dyn StdError + Send + Sync> { Box::new(never) })
+                    .boxed();
 
             Ok(Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .header("Access-Control-Allow-Origin", "*")
-                .body(body) // Use the correctly typed body
-                .context("Failed to build NOT_FOUND response body")?) // This ? unwraps the Result from context, returning the Response
+                .body(body)
+                .context("Failed to build NOT_FOUND response body")?)
         }
     }
 }
@@ -237,7 +225,7 @@ async fn flush_cache_prefix(prefix: String, cache: Arc<Cache>) -> Result<BoxedRe
 
     Response::builder()
         .status(StatusCode::OK)
-        .header("Access-Control-Allow-Origin", "*") // CORS
+        .header("Access-Control-Allow-Origin", "*")
         .body(body)
         .context("Failed to build OK response body for flush_prefix")
 }
@@ -249,7 +237,7 @@ async fn handle_request(
 ) -> Result<BoxedResponse> {
     // Use anyhow::Result
     let (parts, _body) = req.into_parts();
-    let path = parts.uri.path().to_string(); // Clone path for use in match arms
+    let path = parts.uri.path().to_string();
     let method = parts.method;
     let headers = parts.headers;
 
@@ -261,29 +249,22 @@ async fn handle_request(
                 .boxed(),
         )),
         (Method::GET, "/all_files") => list_all_files(pool).await, // Propagates Result
-
-        // Route for flushing cache with prefix
         (Method::DELETE, p) if p.starts_with("/api/v1/flush/prefix/") => {
             let prefix = p.trim_start_matches("/api/v1/flush/prefix/").to_string();
             flush_cache_prefix(prefix, cache).await // Propagates Result
         }
-        // Route for flushing a single cache file by key
         (Method::DELETE, p) if p.starts_with("/api/v1/flush/") => {
             let key = p.trim_start_matches("/api/v1/flush/").to_string();
             flush_cache(key, cache).await // Propagates Result
         }
-        // Generic cache flush route (DELETE /key)
         (Method::DELETE, p) => {
             let key = p.trim_start_matches('/').to_string();
-            flush_cache(key, cache).await // Propagates Result
+            flush_cache(key, cache).await
         }
-        // Route for serving file based on cache key (GET /key)
         (Method::GET, p) => {
             let key = p.trim_start_matches('/').to_string();
             serve_file(key, cache, &headers).await // Propagates Result
         }
-
-        // Handle OPTIONS for CORS preflight
         (Method::OPTIONS, _) => Ok(Response::builder()
             .status(StatusCode::OK)
             .header("Access-Control-Allow-Origin", "*")
@@ -295,8 +276,6 @@ async fn handle_request(
                     .boxed(),
             )
             .context("Failed to build OPTIONS response body")?),
-
-        // Default route for non-matched paths
          _ => Ok(Response::builder()
              .status(StatusCode::NOT_FOUND)
              .body(
@@ -330,13 +309,12 @@ fn internal_server_error(message: String) -> BoxedResponse {
         })
 }
 
-// Helper to create JSON responses - now returns anyhow::Result
 fn json_response<T: Serialize>(data: &T, status: StatusCode) -> Result<BoxedResponse> {
     let json = serde_json::to_string(data).context("Failed to serialize data to JSON")?;
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
-        .header("Access-Control-Allow-Origin", "*") // CORS
+        .header("Access-Control-Allow-Origin", "*")
         .body(
             http_body_util::Full::from(json)
                 .map_err(|never| Box::new(never) as Box<dyn StdError + Send + Sync>)
@@ -344,6 +322,3 @@ fn json_response<T: Serialize>(data: &T, status: StatusCode) -> Result<BoxedResp
         )
         .context("Failed to build JSON response body")
 }
-
-// Removed unused internal_error(err: E) function
-// Removed unused cors_headers function
