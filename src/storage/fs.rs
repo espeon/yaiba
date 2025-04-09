@@ -78,45 +78,75 @@ impl StorageBackend for FilesystemStorage {
     async fn store_streaming(
         &self,
         key: &str,
-        mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
-    ) -> anyhow::Result<()> {
+        mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>,
+    ) -> anyhow::Result<i64> {
         let path = format!("{}/{}", self.base_path, key);
         info!("Storing cache file: {}", path);
-        tokio::spawn(async move {
-            create_dir(&path).await?;
-            let mut file = File::create(&path).await?;
-            let mut result = Ok(());
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(bytes) => {
-                        if let Err(e) = file.write_all(&bytes).await {
-                            result = Err(e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        result = Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+        create_dir(&path).await?; // Propagate error using ?
+        let mut file = File::create(&path).await?; // Propagate error using ?
+
+        let mut loop_error: Option<anyhow::Error> = None;
+        let mut total_bytes: i64 = 0; // Use i64 to match return type
+
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    let bytes_len = bytes.len() as i64; // Cast usize to i64
+                    if let Err(e) = file.write_all(&bytes).await {
+                        // Store the error as anyhow::Error and break
+                        loop_error = Some(e.into());
                         break;
                     }
+                    total_bytes += bytes_len;
+                }
+                Err(e) => {
+                    // Store the stream error as anyhow::Error and break
+                    loop_error = Some(e.into());
+                    break;
                 }
             }
+        }
 
-            if result.is_err() {
-                // Cleanup on error
-                if let Err(e) = tokio::fs::remove_file(&path).await {
-                    warn!("Failed to cleanup cache file: {}", e);
-                }
+        // Ensure data is flushed before checking error or returning success
+        // Only flush if no error occurred during the loop
+        if loop_error.is_none() {
+            if let Err(e) = file.flush().await {
+                // If flush fails, capture that as the error
+                loop_error = Some(e.into());
             }
-            info!("Cache file stored: {}", path);
-            result
-        });
-        Ok(())
+        }
+
+        // Drop the file handle explicitly to close it before potential removal
+        drop(file);
+
+        if let Some(err) = loop_error {
+            // An error occurred, attempt cleanup
+            warn!(
+                "Error storing stream to cache file '{}', attempting cleanup.",
+                path
+            );
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                warn!("Failed to cleanup cache file '{}' after error: {}", path, e);
+            } else {
+                info!("Cleaned up cache file '{}' after error.", path);
+            }
+            // Return the captured error
+            Err(err)
+        } else {
+            // No error occurred, return success
+            info!(
+                "Cache file stored successfully: {} ({} bytes)",
+                path, total_bytes
+            );
+            Ok(total_bytes)
+        }
     }
 
     async fn retrieve(
         &self,
         key: &str,
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>>
+    {
         let path = format!("{}/{}", self.base_path, key);
         info!("Retrieving cache file: {}", path);
         let stream = file_to_stream(&path).await?;
@@ -129,7 +159,7 @@ impl StorageBackend for FilesystemStorage {
         start: u64,
         end: Option<u64>,
     ) -> anyhow::Result<(
-        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>,
         u64,
         u64,
     )> {

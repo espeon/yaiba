@@ -24,13 +24,15 @@ impl StorageBackend for MemoryStorage {
     async fn store_streaming(
         &self,
         key: &str,
-        mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
-    ) -> anyhow::Result<()> {
+        mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>,
+    ) -> anyhow::Result<i64> {
         let storage = self.data.write().await;
         let mut data = Vec::new();
+        let mut bytes_count = 0;
         while let Some(item) = stream.next().await {
             match item {
                 Ok(bytes) => {
+                    bytes_count += bytes.len() as i64;
                     data.push(bytes);
                 }
                 Err(e) => {
@@ -42,13 +44,14 @@ impl StorageBackend for MemoryStorage {
             key.to_string(),
             Bytes::copy_from_slice(&data.into_iter().flatten().collect::<Vec<u8>>()),
         );
-        Ok(())
+        Ok(bytes_count)
     }
 
     async fn retrieve(
         &self,
         key: &str,
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>> {
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>>
+    {
         let storage = self.data.read().await;
         let data_val = storage.get(key);
         if let Some(data) = data_val {
@@ -68,7 +71,7 @@ impl StorageBackend for MemoryStorage {
         _: u64,
         _: Option<u64>,
     ) -> anyhow::Result<(
-        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>,
         u64,
         u64,
     )> {

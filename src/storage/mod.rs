@@ -16,21 +16,21 @@ pub trait StorageBackend: Send + Sync + 'static {
     async fn store_streaming(
         &self,
         key: &str,
-        mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
-    ) -> anyhow::Result<()>;
+        mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>,
+    ) -> anyhow::Result<i64>;
     /// Retrieves data from the storage backend with the given key.
     /// Returns a bytestream meant to be piped to the client.
     async fn retrieve(
         &self,
         key: &str,
-    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>>;
+    ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>>;
     async fn retrieve_range(
         &self,
         key: &str,
         start: u64,
         end: Option<u64>,
     ) -> anyhow::Result<(
-        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
+        Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>,
         u64,
         u64,
     )>;
