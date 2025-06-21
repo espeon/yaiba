@@ -19,6 +19,7 @@ tokio-util = { version = "0.7", default-features = false, features = [
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
+futures-util = "0.3"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 sqlx = { version = "0.8", features = [
     "runtime-tokio-native-tls",

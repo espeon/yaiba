@@ -4,6 +4,8 @@ use futures::Stream;
 use mockall::automock;
 use std::pin::Pin;
 
+use crate::structs::CacheEntry;
+
 pub mod fs;
 pub mod memory;
 
@@ -18,15 +20,15 @@ pub trait StorageBackend: Send + Sync + 'static {
         key: &str,
         mut stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>,
     ) -> anyhow::Result<i64>;
-    /// Retrieves data from the storage backend with the given key.
+    /// Retrieves data from the storage backend with the given cache entry.
     /// Returns a bytestream meant to be piped to the client.
     async fn retrieve(
         &self,
-        key: &str,
+        entry: &CacheEntry,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>>;
     async fn retrieve_range(
         &self,
-        key: &str,
+        entry: &CacheEntry,
         start: u64,
         end: Option<u64>,
     ) -> anyhow::Result<(

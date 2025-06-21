@@ -120,9 +120,19 @@ async fn main() -> Result<()> {
                 let cache_req_clone = cache_clone.clone();
                 let pool_req_clone = pool_clone.clone();
                 async move {
+                    let uri = req.uri().clone();
                     let result = handle_request(req, cache_req_clone, pool_req_clone).await;
+                    // log metadata from result
                     let response = match result {
-                        Ok(resp) => resp,
+                        Ok(resp) => {
+                            info!(
+                                "responding to {} with status {} with headers {:?}",
+                                uri.to_string(),
+                                resp.status(),
+                                resp.headers()
+                            );
+                            resp
+                        }
                         Err(e) => {
                             tracing::error!("Request handling error: {:?}", e);
                             internal_server_error("Internal Server Error".to_string())
@@ -157,7 +167,6 @@ async fn list_all_files(pool: Arc<SqlitePool>) -> Result<BoxedResponse> {
 
 /// serve a file based on a given key
 async fn serve_file(key: String, cache: Arc<Cache>, headers: &HeaderMap) -> Result<BoxedResponse> {
-    // Use anyhow::Result
     let range_header = headers.get("Range");
     let range = if let Some(range_val) = range_header {
         info!("Detected range! {:?}", range_val);
@@ -237,11 +246,18 @@ async fn handle_request(
 ) -> Result<BoxedResponse> {
     // Use anyhow::Result
     let (parts, _body) = req.into_parts();
-    let path = parts.uri.path().to_string();
     let method = parts.method;
     let headers = parts.headers;
 
-    match (method, path.as_str()) {
+    let path = parts.uri.path();
+    let key = if let Some(query) = parts.uri.query() {
+        // Combine path and query, preserving the leading slash for consistency
+        format!("{}?{}", path.trim_start_matches('/'), query)
+    } else {
+        path.trim_start_matches('/').to_string()
+    };
+
+    match (method, path) {
         // Match on &str
         (Method::GET, "/") => Ok(Response::new(
             http_body_util::Full::from(LANDING)
@@ -257,12 +273,8 @@ async fn handle_request(
             let key = p.trim_start_matches("/api/v1/flush/").to_string();
             flush_cache(key, cache).await // Propagates Result
         }
-        (Method::DELETE, p) => {
-            let key = p.trim_start_matches('/').to_string();
-            flush_cache(key, cache).await
-        }
-        (Method::GET, p) => {
-            let key = p.trim_start_matches('/').to_string();
+        (Method::DELETE, _) => flush_cache(key, cache).await,
+        (Method::GET, _) => {
             serve_file(key, cache, &headers).await // Propagates Result
         }
         (Method::OPTIONS, _) => Ok(Response::builder()
@@ -271,20 +283,23 @@ async fn handle_request(
             .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
             .header("Access-Control-Allow-Headers", "*")
             .body(
-                http_body_util::Empty::new() // Use Empty for default
+                http_body_util::Empty::new()
                     .map_err(|never| Box::new(never) as Box<dyn StdError + Send + Sync>)
                     .boxed(),
             )
             .context("Failed to build OPTIONS response body")?),
-         _ => Ok(Response::builder()
-             .status(StatusCode::NOT_FOUND)
-             .body(
-                 http_body_util::Full::from("Not Found")
-                     .map_err(|never| Box::new(never) as Box<dyn StdError + Send + Sync>)
-                     .boxed()
-             )
-             .context("Failed to build Not Found response body")?),
+        (a, b) => {
+            tracing::warn!("Unhandled request: {} {}", a, b);
 
+            return Ok(Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(
+                    http_body_util::Full::from("Not Found")
+                        .map_err(|never| Box::new(never) as Box<dyn StdError + Send + Sync>)
+                        .boxed(),
+                )
+                .context("Failed to build Not Found response body")?);
+        }
     }
 }
 

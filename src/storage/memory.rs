@@ -7,6 +7,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_stream::StreamExt;
 
+use crate::structs::CacheEntry;
+
 use super::StorageBackend;
 
 pub struct MemoryStorage {
@@ -49,14 +51,14 @@ impl StorageBackend for MemoryStorage {
 
     async fn retrieve(
         &self,
-        key: &str,
+        entry: &CacheEntry,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>>
     {
         let storage = self.data.read().await;
+        let key = entry.key.as_ref().expect("Cache entry should have a key");
         let data_val = storage.get(key);
         if let Some(data) = data_val {
             let data = data.value().clone();
-            // Create a stream that yields a single Ok(Bytes) result
             let stream = stream::once(async move { Ok(data) });
             Ok(Box::pin(stream))
         } else {
@@ -64,12 +66,11 @@ impl StorageBackend for MemoryStorage {
         }
     }
 
-    // TODO: implement range retrieval for MemoryStorage!
     async fn retrieve_range(
         &self,
-        _: &str,
-        _: u64,
-        _: Option<u64>,
+        _entry: &CacheEntry,
+        _start: u64,
+        _end: Option<u64>,
     ) -> anyhow::Result<(
         Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>,
         u64,

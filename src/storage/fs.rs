@@ -7,7 +7,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::{fs::File, io::AsyncSeekExt};
 use tokio_stream::StreamExt;
 use tokio_util::codec::{BytesCodec, FramedRead};
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
+
+use crate::structs::CacheEntry;
 
 use super::StorageBackend;
 
@@ -15,12 +17,11 @@ pub struct FilesystemStorage {
     base_path: String,
 }
 
-pub async fn create_dir(path: &str) -> io::Result<()> {
+pub async fn create_dir(path: &str) -> std::io::Result<()> {
     let path = std::path::Path::new(path);
     if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+        trace!("Parent directory: {:?}", parent);
+        tokio::fs::create_dir_all(parent).await?;
     }
     Ok(())
 }
@@ -50,7 +51,7 @@ impl FilesystemStorage {
         if start >= file_size || start > end {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Invalid range specified",
+                format!("Invalid range specified, start is out of bounds or greater than end, start={} file_size={} end={}", start, file_size, end),
             ));
         }
 
@@ -70,6 +71,7 @@ impl FilesystemStorage {
 impl StorageBackend for FilesystemStorage {
     async fn store(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
         let path = format!("{}/{}", self.base_path, key);
+        create_dir(&path).await?;
         let mut file = File::create(&path).await?;
         file.write_all(&data).await?;
         Ok(())
@@ -82,8 +84,8 @@ impl StorageBackend for FilesystemStorage {
     ) -> anyhow::Result<i64> {
         let path = format!("{}/{}", self.base_path, key);
         info!("Storing cache file: {}", path);
-        create_dir(&path).await?; // Propagate error using ?
-        let mut file = File::create(&path).await?; // Propagate error using ?
+        create_dir(&path).await?;
+        let mut file = File::create(&path).await?;
 
         let mut loop_error: Option<anyhow::Error> = None;
         let mut total_bytes: i64 = 0; // Use i64 to match return type
@@ -144,9 +146,10 @@ impl StorageBackend for FilesystemStorage {
 
     async fn retrieve(
         &self,
-        key: &str,
+        entry: &CacheEntry,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Sync>>>
     {
+        let key = entry.key.as_ref().expect("Cache entry should have a key");
         let path = format!("{}/{}", self.base_path, key);
         info!("Retrieving cache file: {}", path);
         let stream = file_to_stream(&path).await?;
@@ -155,7 +158,7 @@ impl StorageBackend for FilesystemStorage {
 
     async fn retrieve_range(
         &self,
-        key: &str,
+        entry: &CacheEntry,
         start: u64,
         end: Option<u64>,
     ) -> anyhow::Result<(
@@ -163,12 +166,12 @@ impl StorageBackend for FilesystemStorage {
         u64,
         u64,
     )> {
+        let key = entry.key.as_ref().expect("Cache entry should have a key");
         let path = format!("{}/{}", self.base_path, key);
         info!(
             "Retrieving cache file range: {} ({}-{:?})",
             path, start, end
         );
-        // Returns a stream and the end of the range
         let (stream, r_end, size) = Self::file_to_stream_range(&path, start, end).await?;
         info!(
             "Stream range: start={}, end={}, size={}",

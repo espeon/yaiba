@@ -1,20 +1,18 @@
 use bytes::Bytes;
 use http_body::Frame;
 use http_body_util::{combinators::BoxBody, BodyExt, StreamBody};
-use hyper::{HeaderMap, StatusCode};
+use hyper::{header::HeaderValue, HeaderMap, StatusCode};
 use reqwest::Response;
 use std::{
     error::Error as StdError,
-    io,
+    io::{self, Error},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-}; // Use hyper types directly
+};
 
 use futures::{Stream, TryStreamExt};
 use sqlx::SqlitePool;
-use tokio::sync::broadcast;
-use tokio_stream::StreamExt;
 
 use crate::{
     metadata::{CacheMetadataBackend, CacheScoringPolicy},
@@ -42,6 +40,31 @@ pub struct Cache {
     //db_pool: Arc<SqlitePool>, // Keep pool for access recording if needed elsewhere
 }
 
+// Taking in a content type and file size, determine if the cache should support range requests
+fn should_support_range(content_type: &Option<String>, size_bytes: i64) -> bool {
+    // Check if content type is None or file size is less than 5 KiB
+    if content_type.is_none() || size_bytes <= 5 * 1024 {
+        return false;
+    }
+    let ct = content_type.as_ref().unwrap();
+
+    // List of content-type prefixes that commonly support range requests
+    let range_supported_prefixes = ["video/", "audio/", "image/"];
+
+    // List of specific content-types that support range requests
+    let range_supported_types = [
+        "application/octet-stream",
+        "application/pdf",
+        "application/zip",
+        "application/x-tar",
+    ];
+
+    range_supported_prefixes
+        .iter()
+        .any(|prefix| ct.starts_with(prefix))
+        || range_supported_types.iter().any(|typ| ct == typ)
+}
+
 impl Cache {
     pub fn new(
         storage: Arc<dyn StorageBackend>,
@@ -60,35 +83,42 @@ impl Cache {
             //db_pool,
         }
     }
-    /// gets a file from the cache, and pulls from source and puts into cache if it doesn't exist
-    // Inside yaiba/src/cache.rs
 
+    /// Get a file from the cache, downloading it if not found
     pub async fn get(
         &self,
         k: String,
         range: Option<(u64, Option<u64>)>,
         _last_modified_query: Option<String>,
-        // ) -> anyhow::Result<(StreamBody, HeaderMap, StatusCode)> { // OLD (StreamBody isn't quite right, and inconsistent with download_file branch)
     ) -> anyhow::Result<(CacheBoxBody, HeaderMap, StatusCode)> {
         // NEW - Use CacheBoxBody consistently
         let metadata = self.metadata.get_metadata(&k).await?;
 
-        let key = match metadata.and_then(|e| e.key) {
+        let entry = match metadata {
             None => {
                 // download_file now returns the correct tuple type
                 return self.download_file(&k, range).await;
             }
-            Some(key) => key,
+            Some(e) => e,
         };
 
         if let Some((start, end)) = range {
             // handle_range_request now returns the correct tuple type
-            return self.handle_range_request(&k, &key, start, end).await;
+            return self.handle_range_request(&k, &entry, start, end).await;
         }
 
-        match self.storage.retrieve(&key).await {
+        match self.storage.retrieve(&entry).await {
             Ok(stream) => {
                 self.spawn_access_recorder(&k);
+                let mut headers = HeaderMap::new();
+                // Add content-type header if present
+                if let Some(ref ct) = entry.content_type {
+                    let ctype: HeaderValue = ct.parse().unwrap();
+                    headers.insert("content-type", ctype);
+                }
+                if should_support_range(&entry.content_type, entry.size.unwrap_or(0)) {
+                    headers.insert("Accept-Ranges", "bytes".parse().unwrap());
+                }
                 // Convert stream to BoxBody
                 let body = StreamBody::new(
                     stream
@@ -96,14 +126,34 @@ impl Cache {
                         .map_ok(Frame::data),
                 )
                 .boxed();
-                Ok((
-                    body,
-                    HeaderMap::new(), // You might want more headers here
-                    StatusCode::OK,
-                ))
+                Ok((body, headers, StatusCode::OK))
             }
-            Err(_) => {
-                warn!("File could not be found on disk, attempting delete and redownload");
+            Err(e) => {
+                if e.to_string().contains("Invalid range specified") {
+                    // send back a content-range header as well
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        "content-range",
+                        format!("bytes */{}", entry.size.unwrap_or(0))
+                            .parse()
+                            .unwrap(),
+                    );
+                    return Ok((
+                        StreamBody::new(
+                            futures::stream::once(async {
+                                Ok(Bytes::from_static(b"Range not satisfiable"))
+                            })
+                            .map_err(|e: Error| {
+                                Box::new(e) as Box<dyn StdError + Send + Sync + 'static>
+                            })
+                            .map_ok(Frame::data),
+                        )
+                        .boxed(),
+                        HeaderMap::new(),
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                    ));
+                }
+                warn!("Ignoring error encountered when requesting file, attempting delete and redownload: {e}");
                 self.metadata.delete_metadata(&k).await?;
                 // download_file now returns the correct tuple type
                 self.download_file(&k, range).await
@@ -111,38 +161,36 @@ impl Cache {
         }
     }
 
+    /// Download a file from the URL base, saving it to disk and returning the body, headers, and status code
     async fn download_file(
         &self,
         k: &str,
         range: Option<(u64, Option<u64>)>,
-        // ) -> anyhow::Result<(BoxedResponse, HeaderMap, StatusCode)> { // OLD
     ) -> anyhow::Result<(CacheBoxBody, HeaderMap, StatusCode)> {
-        // NEW - Return tuple with CacheBoxBody
         let (stream, headers, statuscode) = self
             .stream_url_to_disk_and_client(format!("{}{}", self.url_base, k), k, range)
             .await?;
 
-        // Convert the stream into a BoxBody
-        // Map the std::io::Error from the stream to a Box<dyn StdError...>
         let body = StreamBody::new(
             stream
                 .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync + 'static>)
                 .map_ok(Frame::data),
         )
-        .boxed(); // Box it into CacheBoxBody
-
-        // Return the tuple, not a full response
+        .boxed();
         Ok((body, headers, statuscode))
     }
 
+    /// Handle a range request, returning the appropriate body, headers, and status code
     async fn handle_range_request(
         &self,
-        k: &str,   // Add original key 'k' for recording access
-        key: &str, // key from metadata (actual storage key)
+        // metadata key
+        k: &str,
+        // cache entry
+        entry: &CacheEntry,
         start: u64,
         end: Option<u64>,
     ) -> anyhow::Result<(CacheBoxBody, HeaderMap, StatusCode)> {
-        match self.storage.retrieve_range(key, start, end).await {
+        match self.storage.retrieve_range(entry, start, end).await {
             Ok((stream, end, size)) => {
                 let mut headers = HeaderMap::new();
                 // For further reference:
@@ -153,9 +201,11 @@ impl Cache {
                     format!("{}", end - start + 1).parse().unwrap(),
                 );
                 headers.append("content-range", fmt.parse().unwrap());
-                self.spawn_access_recorder(k); // Use original key `k` for metadata
+                if let Some(ref ct) = entry.content_type {
+                    headers.insert("content-type", ct.parse().unwrap());
+                }
+                self.spawn_access_recorder(k);
                 let body = StreamBody::new(
-                    // Assuming retrieve_range stream is already Result<Bytes, io::Error>
                     stream
                         .map_err(|e| Box::new(e) as Box<dyn StdError + Send + Sync + 'static>)
                         .map_ok(Frame::data),
@@ -163,25 +213,48 @@ impl Cache {
                 .boxed(); // Box it
                 Ok((body, headers, StatusCode::PARTIAL_CONTENT))
             }
-            Err(_) => {
-                warn!("File could not be found on disk, attempting delete and redownload");
+            Err(e) => {
+                if e.to_string().contains("Invalid range specified") {
+                    // send back a content-range header as well
+                    let mut headers = HeaderMap::new();
+                    headers.insert(
+                        "content-range",
+                        format!("bytes */{}", entry.size.unwrap_or(0))
+                            .parse()
+                            .unwrap(),
+                    );
+                    return Ok((
+                        StreamBody::new(
+                            futures::stream::once(async { Ok(Bytes::from_static(b"")) })
+                                .map_err(|e: Error| {
+                                    Box::new(e) as Box<dyn StdError + Send + Sync + 'static>
+                                })
+                                .map_ok(Frame::data),
+                        )
+                        .boxed(),
+                        headers,
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                    ));
+                }
+                warn!("Ignoring error encountered when requesting file, attempting delete and redownload: {e}");
                 self.metadata.delete_metadata(k).await?;
                 self.download_file(k, Some((start, end))).await
             }
         }
     }
 
+    /// Spawn a background task to record access to the cache entry
     fn spawn_access_recorder(&self, key: &str) {
         let key = key.to_string();
-        let metadata_clone = self.metadata.clone(); // Clone only metadata Arc
+        let metadata_clone = self.metadata.clone();
         tokio::spawn(async move {
             if let Err(e) = metadata_clone.record_access(&key).await {
-                // Call directly on metadata
                 warn!("error recording access to {}: {}", &key, e);
             }
         });
     }
 
+    /// Put a file into the cache, saving its metadata
     pub async fn put(
         &self,
         k: &str,
@@ -193,8 +266,6 @@ impl Cache {
             .put_metadata(k, size_bytes, DEFAULT_TIER, content_type)
             .await
     }
-
-    // Removed record_access as it's now called directly via metadata in spawn_access_recorder
 
     /// Delete a file (flush it from cache and storage)
     pub async fn delete(&self, key: &str) -> anyhow::Result<()> {
@@ -385,7 +456,6 @@ impl Cache {
             status,
         ))
     }
-
     /// Stream a file from a URL, split into two streams: one for the storage backend, one for the client
     pub async fn stream_url_to_disk_and_client(
         &self,
@@ -401,7 +471,7 @@ impl Cache {
         let status = req.status();
         let headers = req.headers().clone();
 
-        let mut hm = hyper::HeaderMap::new();
+        let hm = hyper::HeaderMap::new();
 
         // Handle non-success status codes (same as before)
         if !status.is_success()
@@ -418,9 +488,90 @@ impl Cache {
 
         debug!("status code {}", status);
 
-        if status != StatusCode::PARTIAL_CONTENT {
+        // If this is a non-range request, stream to client and disk simultaneously (current behavior)
+        if range.is_none() {
+            debug!("Handling as one-shot stream for {}", name);
             return self.stream_url_one_shot(req, &name).await;
         }
+
+        // If this is a range request and the origin supports ranges (206 Partial Content), stream partial content to disk and client
+        if status == StatusCode::PARTIAL_CONTENT {
+            debug!(
+                "Origin supports range requests, streaming partial content for {}",
+                name
+            );
+
+            let headers = req.headers().clone();
+            let status = req.status();
+            let bytes = req.bytes().await?;
+            let content_type = headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string());
+
+            let storage = self.storage.clone();
+            let name = name.to_string();
+            let self_clone = self.clone();
+            let content_type_clone = content_type.clone();
+
+            let content_length = bytes.len();
+
+            let inner_name = name.clone();
+            // Spawn ensure_space and put_metadata
+            let ensure_space_handle = tokio::spawn(async move {
+                if let Err(e) = self_clone.ensure_space(content_length as i64).await {
+                    error!("Failed to ensure cache space: {}", e);
+                    return Err(e); // Propagate error
+                }
+                if let Err(e) = self_clone
+                    .put(&inner_name, content_length as i64, content_type_clone)
+                    .await
+                {
+                    error!("Failed to put cache entry: {}", e);
+                    return Err(e); // Propagate error
+                }
+                Ok(())
+            });
+
+            let self_clone = self.clone();
+            let bytes_clone = bytes.clone();
+
+            let inner_name = name.clone();
+            tokio::spawn(async move {
+                // Wait for ensure_space and put to complete successfully
+                if let Err(e) = ensure_space_handle.await? {
+                    warn!("Cache space management or metadata put failed: {}", e);
+                    return Ok::<(), io::Error>(());
+                }
+                if let Err(e) = storage.store(&inner_name, bytes_clone).await {
+                    warn!("Failed to store stream: {}", e);
+                    // delete metadata if storage fails
+                    if let Err(del_err) = self_clone.metadata.delete_metadata(&name).await {
+                        warn!(
+                            "Failed to delete metadata after storage failure for {}: {}",
+                            name, del_err
+                        );
+                    }
+                }
+                Ok(())
+            });
+
+            // headers for client
+            let mut hm = hyper::HeaderMap::new();
+            for (key, value) in headers.iter() {
+                hm.insert(key, value.clone());
+            }
+
+            return Ok((
+                Box::pin(futures::stream::once(async move { Ok(bytes) })),
+                hm,
+                status,
+            ));
+        }
+
+        // If this is a range request, but the origin does not support range requests,
+        // download the full file, store it, then serve the requested range from disk.
+        debug!("Origin does NOT support range requests, downloading full file and serving requested range from disk for {}", name);
 
         let content_length = headers
             .get("content-length")
@@ -428,50 +579,28 @@ impl Cache {
             .and_then(|v| v.parse::<u64>().ok())
             .ok_or_else(|| anyhow::anyhow!("Missing Content-Length"))?;
 
-        let range_response = headers.get("Range").and_then(|v| v.to_str().ok());
-        info!("range_response: {:?}", range_response);
-
-        // Validate the range
-        let (start, end) = match range {
-            Some((s, e)) => {
-                let mut end = e.unwrap_or(content_length - 1);
-                if s > end || end >= content_length {
-                    info!("Invalid range, falling back to full content");
-                    end = content_length - 1;
-                }
-                (s, end)
-            }
-            None => {
-                // If no range requested, default to full content
-                (0, content_length - 1)
-            }
-        };
-
         // Get content-type for later storage
-        // TODO: there's probably a much better way to do HeaderValue -> String
         let content_type = headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string());
 
-        // set broadcast to 5kib
-        let (tx, rx) = broadcast::channel::<Bytes>(65536);
+        // Download the full file and store it to disk
+        let bytes = req.bytes().await?;
         let storage = self.storage.clone();
         let name = name.to_string();
-
-        // Clone for background tasks
         let self_clone = self.clone();
-        let name_clone = name.clone();
-        let content_type_clone = content_type.clone(); // Clone content_type
+        let content_type_clone = content_type.clone();
 
-        // Spawn ensure_space and put_metadata
+        let inner_name = name.clone();
+        // Ensure space and put metadata
         let ensure_space_handle = tokio::spawn(async move {
             if let Err(e) = self_clone.ensure_space(content_length as i64).await {
                 error!("Failed to ensure cache space: {}", e);
                 return Err(e); // Propagate error
             }
             if let Err(e) = self_clone
-                .put(&name_clone, content_length as i64, content_type_clone) // Use cloned content_type
+                .put(&inner_name, content_length as i64, content_type_clone)
                 .await
             {
                 error!("Failed to put cache entry: {}", e);
@@ -480,64 +609,110 @@ impl Cache {
             Ok(())
         });
 
-        // Split the original stream into two:
-        // 1. Save the FULL stream to disk
-        // 2. Slice the RANGE for the client
-        let original_stream = req
-            .bytes_stream()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-
-        // Spawn disk writer (full content)
-        let disk_stream = original_stream
-            .map_ok(move |bytes| {
-                if tx.send(bytes.clone()).is_err() {
-                    // do nothing for now
-                    //warn!("Failed to send bytes to storage: {}", e);
-                }
-                bytes
-            })
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-        let storage_stream = Box::pin(disk_stream);
-
-        let self_clone = self.clone();
-
-        tokio::spawn(async move {
-            // Wait for ensure_space and put to complete successfully
-            if let Err(e) = ensure_space_handle.await? {
-                // Handle JoinError and inner Result
-                warn!("Cache space management or metadata put failed: {}", e);
-                return Ok::<(), io::Error>(());
+        if let Err(e) = ensure_space_handle.await? {
+            warn!("Cache space management or metadata put failed: {}", e);
+            return Err(e);
+        }
+        if let Err(e) = storage.store(&name, bytes).await {
+            warn!("Failed to store stream: {}", e);
+            // delete metadata if storage fails
+            if let Err(del_err) = self.metadata.delete_metadata(&name).await {
+                warn!(
+                    "Failed to delete metadata after storage failure for {}: {}",
+                    name, del_err
+                );
             }
-
-            if let Err(e) = storage.store_streaming(&name, storage_stream).await {
-                warn!("Failed to store stream: {}", e);
-                // delete metadata if storage fails
-                if let Err(del_err) = self_clone.metadata.delete_metadata(&name).await {
-                    warn!(
-                        "Failed to delete metadata after storage failure for {}: {}",
-                        name, del_err
-                    );
-                }
-            }
-            Ok(())
-        });
-
-        // headers for client
-        for (key, value) in headers.iter() {
-            hm.insert(key, value.clone());
         }
 
-        // Create client stream (sliced range)
-        let client_stream = RangeStream {
-            inner: tokio_stream::wrappers::BroadcastStream::new(rx)
-                .filter_map(|x| x.ok()) // Ignore broadcast errors
-                .map(Ok::<Bytes, std::io::Error>), // Convert Bytes to Result<Bytes, Error>
-            current: 0,
-            start,
-            end,
+        // Wait for the file to be stored before serving the range
+        // (in practice, you may want to optimize this, but for correctness, we wait)
+        // Retrieve the cache entry for the file
+        let entry = self
+            .metadata
+            .get_metadata(&name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Cache entry not found after storing file"))?;
+
+        // Validate the range
+        let (start, end) = match range {
+            Some((s, e)) => {
+                let end = e.unwrap_or(content_length - 1);
+                if s > end || end >= content_length {
+                    info!("Invalid range, returning not satisfiable");
+                    return Ok((
+                        Box::pin(futures::stream::once(async move {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "Range not satisfiable",
+                            ))
+                        })),
+                        HeaderMap::new(),
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                    ));
+                }
+                (s, end)
+            }
+            None => (0, content_length - 1),
         };
 
-        Ok((Box::pin(client_stream), hm, status))
+        debug!("{:?}", entry);
+
+        match self.storage.retrieve_range(&entry, start, Some(end)).await {
+            Ok((stream, end, size)) => {
+                let mut headers = HeaderMap::new();
+                // For further reference:
+                // If there's an equals sign here, it breaks ffmpeg :)
+                let fmt = &format!("bytes {:?}-{:?}/{:?}", start, end, size);
+                headers.append(
+                    "content-length",
+                    format!("{}", end - start + 1).parse().unwrap(),
+                );
+                headers.append("content-range", fmt.parse().unwrap());
+                if let Some(ref ct) = entry.content_type {
+                    headers.insert("content-type", ct.parse().unwrap());
+                }
+                if should_support_range(&entry.content_type, entry.size.unwrap_or(0)) {
+                    headers.insert("Accept-Ranges", "bytes".parse().unwrap());
+                }
+                self.spawn_access_recorder(
+                    entry
+                        .key
+                        .as_ref()
+                        .expect("has key (we just put it in there...)"),
+                );
+                return Ok((stream, headers, StatusCode::PARTIAL_CONTENT));
+            }
+            Err(e) => {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "content-range",
+                    format!("bytes */{}", entry.size.unwrap_or(0))
+                        .parse()
+                        .unwrap(),
+                );
+                // if error is an io invalid input, return RangeNotSatisfiable
+                if e.to_string().contains("Invalid range specified") {
+                    return Ok((
+                        Box::pin(futures::stream::once(async move {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "Range not satisfiable",
+                            ))
+                        })),
+                        headers,
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                    ));
+                }
+                warn!("Ignoring error encountered when requesting file, attempting delete and redownload: {e}");
+                self.metadata.delete_metadata(&name).await?;
+
+                // just return an error for now
+                return Err(anyhow::anyhow!(
+                    "Failed to retrieve range after storing file: {}",
+                    e
+                ));
+            }
+        }
     }
 }
 

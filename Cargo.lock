@@ -2748,6 +2748,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "futures",
+ "futures-util",
  "http-body",
  "http-body-util",
  "hyper",
